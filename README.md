@@ -1,4 +1,4 @@
-# Local Embedding Models Performance Benchmark
+# Benchmark de performance e latência para modelos de embedding
 
 Benchmark modular de alta performance para modelos de embedding locais com **FastAPI** e interface CLI, desenvolvido para avaliar latência, vazão (throughput), pegada de memória (RAM e VRAM GPU) e integridade dos vetores gerados a partir de documentos reais (**PDF, DOCX, DOC, ODT, TXT**).
 
