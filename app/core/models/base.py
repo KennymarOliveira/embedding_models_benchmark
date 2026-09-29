@@ -1,10 +1,14 @@
 import gc
 import logging
 import os
-import resource
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import resource
+except ModuleNotFoundError:  # Windows não possui esse módulo, então usamos fallback
+    resource = None
 
 import numpy as np
 import psutil
@@ -18,8 +22,13 @@ def get_process_memory_mb() -> float:
     try:
         return round(psutil.Process(os.getpid()).memory_info().rss / (1024**2), 2)
     except Exception:
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return round(rss_kb / 1024.0, 2)
+        if resource is not None:
+            try:
+                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                return round(rss_kb / 1024.0, 2)
+            except Exception:
+                pass
+        return 0.0
 
 
 def get_gpu_memory_mb() -> Dict[str, float]:
@@ -230,4 +239,3 @@ class BaseEmbeddingModel(ABC):
             "is_loaded": self.is_loaded,
             "load_time_seconds": self.load_time_seconds,
         }
-

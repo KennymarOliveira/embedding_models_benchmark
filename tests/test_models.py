@@ -58,6 +58,14 @@ def test_model_encoding_and_metrics():
     assert model.model is None
 
 
+def test_windows_safe_import_and_memory_fallback():
+    import importlib
+
+    module = importlib.import_module("app.core.models.base")
+    assert hasattr(module, "get_process_memory_mb")
+    assert isinstance(module.get_process_memory_mb(), float)
+
+
 def test_config_lookup():
     bge_cfg = get_model_config("bge-m3")
     assert bge_cfg["model_id"] == "BAAI/bge-m3"
