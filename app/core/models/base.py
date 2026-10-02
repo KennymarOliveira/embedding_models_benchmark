@@ -14,6 +14,8 @@ import numpy as np
 import psutil
 import torch
 
+from app.core.resource_guard import SystemResourceGuard
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,7 +72,7 @@ class BaseEmbeddingModel(ABC):
         """Método interno para instanciar o modelo específico."""
         pass
 
-    def load(self) -> float:
+    def load(self, resource_guard: Optional[SystemResourceGuard] = None) -> float:
         """Carrega o modelo na memória e calcula o tempo de cold-start."""
         if self.is_loaded and self.model is not None:
             return 0.0
@@ -79,9 +81,13 @@ class BaseEmbeddingModel(ABC):
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.empty_cache()
 
+        if resource_guard:
+            resource_guard.checkpoint()
         self.ram_before_load_mb = get_process_memory_mb()
         start_time = time.perf_counter()
         self.model = self._load_model()
+        if resource_guard:
+            resource_guard.checkpoint()
         self.load_time_seconds = round(time.perf_counter() - start_time, 4)
         self.is_loaded = True
 
@@ -106,13 +112,22 @@ class BaseEmbeddingModel(ABC):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-    def warmup(self, sample_text: str = "Warm-up de teste de inferência.") -> float:
+    def warmup(
+        self,
+        sample_text: str = "Warm-up de teste de inferência.",
+        resource_guard: Optional[SystemResourceGuard] = None,
+    ) -> float:
         """Executa um ciclo rápido de aquecimento de GPU/CPU."""
         if not self.is_loaded:
-            self.load()
+            self.load(resource_guard=resource_guard)
+
+        if resource_guard:
+            resource_guard.checkpoint()
 
         start_time = time.perf_counter()
         self._encode_batch([sample_text], batch_size=1)
+        if resource_guard:
+            resource_guard.checkpoint()
         if torch.cuda.is_available() and "cuda" in self.device:
             torch.cuda.synchronize()
         warmup_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -128,6 +143,7 @@ class BaseEmbeddingModel(ABC):
         texts: List[str],
         batch_size: Optional[int] = None,
         measure_per_chunk: bool = True,
+        resource_guard: Optional[SystemResourceGuard] = None,
     ) -> Tuple[np.ndarray, List[float], Dict[str, Any]]:
         """
         Gera embeddings para a lista de textos e calcula métricas completas de tempo e memória.
@@ -138,7 +154,10 @@ class BaseEmbeddingModel(ABC):
         - metrics_meta: Dicionário contendo tempos totais, vazão e consumo de memória
         """
         if not self.is_loaded:
-            self.load()
+            self.load(resource_guard=resource_guard)
+
+        if resource_guard:
+            resource_guard.checkpoint()
 
         effective_batch_size = batch_size or self.default_batch_size
         num_texts = len(texts)
@@ -161,8 +180,12 @@ class BaseEmbeddingModel(ABC):
 
         if measure_per_chunk and effective_batch_size == 1:
             for idx, text in enumerate(texts):
+                if resource_guard:
+                    resource_guard.checkpoint()
                 t0 = time.perf_counter()
                 emb = self._encode_batch([text], batch_size=1)
+                if resource_guard:
+                    resource_guard.checkpoint()
                 if torch.cuda.is_available() and "cuda" in self.device:
                     torch.cuda.synchronize()
                 t_diff = (time.perf_counter() - t0) * 1000
@@ -171,11 +194,15 @@ class BaseEmbeddingModel(ABC):
             final_embeddings = np.array(all_embeddings)
         else:
             for i in range(0, num_texts, effective_batch_size):
+                if resource_guard:
+                    resource_guard.checkpoint()
                 batch_texts = texts[i : i + effective_batch_size]
                 batch_count = len(batch_texts)
 
                 t0 = time.perf_counter()
                 batch_embs = self._encode_batch(batch_texts, batch_size=effective_batch_size)
+                if resource_guard:
+                    resource_guard.checkpoint()
                 if torch.cuda.is_available() and "cuda" in self.device:
                     torch.cuda.synchronize()
                 batch_elapsed_ms = (time.perf_counter() - t0) * 1000

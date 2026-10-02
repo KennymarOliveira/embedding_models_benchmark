@@ -30,6 +30,14 @@ class ModelBenchmarkMetrics(BaseModel):
     ram_before_mb: float
     ram_after_mb: float
     ram_delta_mb: float
+    system_ram_peak_percent: float = 0.0
+    system_ram_peak_mb: float = 0.0
+    swap_peak_percent: float = 0.0
+    disk_space_peak_percent: float = 0.0
+    disk_activity_peak_percent: Optional[float] = None
+    resource_samples: int = 0
+    interrupted_by_resource_guard: bool = False
+    interruption_reason: Optional[str] = None
     gpu_allocated_mb: float
     gpu_peak_mb: float
     gpu_reserved_mb: float

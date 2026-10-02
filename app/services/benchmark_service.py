@@ -1,9 +1,11 @@
 import json
 import logging
+import multiprocessing
 import os
+from queue import Empty
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 import uuid
 
 import torch
@@ -19,10 +21,13 @@ from app.core.config import (
     GPU_VRAM_TOTAL_MB,
     HAS_CUDA,
     RESULTS_DIR,
+    get_model_config,
     list_enabled_models,
 )
 from app.core.extractors.file_extractor import extract_text
+from app.core.models.base import BaseEmbeddingModel
 from app.core.models.registry import ModelRegistry
+from app.core.resource_guard import ResourceLimitExceeded, SystemResourceGuard
 from app.schemas.benchmark import (
     BenchmarkRankings,
     BenchmarkResponse,
@@ -34,6 +39,82 @@ from app.schemas.benchmark import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _model_worker(
+    model_class: Type[BaseEmbeddingModel],
+    model_config: Dict[str, Any],
+    chunk_texts: List[str],
+    batch_size: Optional[int],
+    result_queue,
+) -> None:
+    """Executa um único modelo fora do processo que monitora o computador."""
+    model_instance = None
+    try:
+        model_instance = model_class(model_config)
+        load_time = model_instance.load()
+        warmup_ms = model_instance.warmup()
+        _embeddings, chunk_times_ms, meta = model_instance.encode(chunk_texts, batch_size=batch_size)
+        result_queue.put(
+            {
+                "ok": True,
+                "load_time": load_time,
+                "warmup_ms": warmup_ms,
+                "chunk_times_ms": chunk_times_ms,
+                "meta": meta,
+                "model_id": model_instance.model_id,
+                "display_name": model_instance.display_name,
+                "device": model_instance.device,
+                "embedding_dimension": model_instance.get_dimensions(),
+            }
+        )
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": str(exc)})
+    finally:
+        if model_instance is not None:
+            model_instance.unload()
+
+
+def _run_model_in_isolated_process(
+    model_name: str,
+    chunk_texts: List[str],
+    batch_size: Optional[int],
+    resource_guard: SystemResourceGuard,
+) -> Dict[str, Any]:
+    """Executa e, se necessário, termina o processo do modelo isoladamente."""
+    model_config = get_model_config(model_name).copy()
+    model_class = ModelRegistry.get_model_class(model_config.get("class_key", "generic_st"))
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_model_worker,
+        args=(model_class, model_config, chunk_texts, batch_size, result_queue),
+        name=f"benchmark-{model_name}",
+    )
+    process.start()
+
+    try:
+        while process.is_alive():
+            process.join(timeout=0.2)
+            resource_guard.checkpoint()
+
+        try:
+            return result_queue.get(timeout=2)
+        except Empty as exc:
+            raise RuntimeError(
+                f"O processo do modelo terminou sem retornar resultado (código {process.exitcode})."
+            ) from exc
+    except ResourceLimitExceeded:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3)
+        raise
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3)
+        result_queue.close()
+        result_queue.join_thread()
 
 
 def format_summary_text(response: BenchmarkResponse) -> str:
@@ -154,15 +235,24 @@ def run_document_benchmark(
 
     for model_name in selected_models:
         logger.info("==> Iniciando benchmark para o modelo: %s", model_name)
+        # Cada modelo recebe seu próprio monitor. Assim, os picos e uma
+        # eventual interrupção ficam associados ao resultado correto.
+        resource_guard = SystemResourceGuard()
+        resource_guard.start()
         try:
-            model_instance = ModelRegistry.create_model(model_name)
-            load_time = model_instance.load()
-            warmup_ms = model_instance.warmup()
-
-            embeddings, chunk_times_ms, meta = model_instance.encode(
+            worker_result = _run_model_in_isolated_process(
+                model_name,
                 chunk_texts,
-                batch_size=batch_size,
+                batch_size,
+                resource_guard,
             )
+            if not worker_result["ok"]:
+                raise RuntimeError(worker_result["error"])
+
+            load_time = worker_result["load_time"]
+            warmup_ms = worker_result["warmup_ms"]
+            chunk_times_ms = worker_result["chunk_times_ms"]
+            meta = worker_result["meta"]
 
             total_inf_sec = max(0.0001, meta["total_inference_time_seconds"])
             tokens_per_sec = round(total_tokens / total_inf_sec, 2)
@@ -190,10 +280,10 @@ def run_document_benchmark(
 
             metric_entry = ModelBenchmarkMetrics(
                 model_name=model_name,
-                model_id=model_instance.model_id,
-                display_name=model_instance.display_name,
-                device=model_instance.device,
-                embedding_dimension=meta.get("embedding_dimension", model_instance.get_dimensions()),
+                model_id=worker_result["model_id"],
+                display_name=worker_result["display_name"],
+                device=worker_result["device"],
+                embedding_dimension=meta.get("embedding_dimension", worker_result["embedding_dimension"]),
                 load_time_seconds=load_time,
                 warmup_time_ms=warmup_ms,
                 total_inference_time_seconds=meta["total_inference_time_seconds"],
@@ -208,6 +298,7 @@ def run_document_benchmark(
                 ram_before_mb=meta["ram_before_mb"],
                 ram_after_mb=meta["ram_after_mb"],
                 ram_delta_mb=meta["ram_delta_mb"],
+                **resource_guard.metrics(),
                 gpu_allocated_mb=meta["gpu_allocated_mb"],
                 gpu_peak_mb=meta["gpu_peak_mb"],
                 gpu_reserved_mb=meta["gpu_reserved_mb"],
@@ -241,6 +332,7 @@ def run_document_benchmark(
                 ram_before_mb=0.0,
                 ram_after_mb=0.0,
                 ram_delta_mb=0.0,
+                **resource_guard.metrics(),
                 gpu_allocated_mb=0.0,
                 gpu_peak_mb=0.0,
                 gpu_reserved_mb=0.0,
@@ -251,9 +343,7 @@ def run_document_benchmark(
                 error=str(exc),
             )
         finally:
-            # Libera VRAM/RAM explicitamente entre modelos
-            if "model_instance" in locals():
-                model_instance.unload()
+            resource_guard.stop()
 
     successful_results = {k: v for k, v in results.items() if v.error is None}
     rankings = BenchmarkRankings()

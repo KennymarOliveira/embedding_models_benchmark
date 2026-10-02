@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -25,6 +24,14 @@ DEFAULT_CHUNK_STRATEGY = "paragraph"
 DEFAULT_NORMALIZE_EMBEDDINGS = True
 WARMUP_RUNS = 1
 
+# Proteção de recursos do computador.
+RESOURCE_GUARD_SAMPLE_INTERVAL_SECONDS = 1.0
+RESOURCE_GUARD_WARNING_PERCENT = 85.0
+RESOURCE_GUARD_CRITICAL_PERCENT = 90.0
+RESOURCE_GUARD_STOP_PERCENT = 95.0
+RESOURCE_GUARD_CONSECUTIVE_SAMPLES = 5
+RESOURCE_GUARD_DISK_PATH = BASE_DIR.anchor or "/"
+
 AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
     "bge-m3": {
         "model_id": "BAAI/bge-m3",
@@ -43,7 +50,7 @@ AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "Qwen3 Embedding 8B",
         "class_key": "qwen3",
         "max_seq_length": 8192,
-        "default_batch_size": 2,
+        "default_batch_size": 8,
         "device": DEFAULT_DEVICE,
         "torch_dtype": "bfloat16" if HAS_CUDA else "float32",
         "normalize_embeddings": True,
