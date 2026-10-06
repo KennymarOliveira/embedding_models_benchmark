@@ -33,6 +33,12 @@ class ModelBenchmarkMetrics(BaseModel):
     system_ram_peak_percent: float = 0.0
     system_ram_peak_mb: float = 0.0
     swap_peak_percent: float = 0.0
+    ram_warning_emitted: bool = False
+    commit_peak_percent: Optional[float] = None
+    paging_peak_pages_per_second: Optional[float] = None
+    paging_activity_detected: Optional[bool] = None
+    process_ram_peak_mb: Optional[float] = None
+    process_ram_peak_percent: Optional[float] = None
     disk_space_peak_percent: float = 0.0
     disk_activity_peak_percent: Optional[float] = None
     resource_samples: int = 0

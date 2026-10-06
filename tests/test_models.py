@@ -1,12 +1,10 @@
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
 from app.core.config import AVAILABLE_MODELS, get_model_config
 from app.core.models.base import BaseEmbeddingModel
 from app.core.models.registry import ModelRegistry
-from app.core.resource_guard import ResourceLimitExceeded, SystemResourceGuard
+from app.core.resource_guard import ResourceLimitExceeded, ResourceSnapshot, SystemResourceGuard
 
 
 class DummyMockModel(BaseEmbeddingModel):
@@ -71,23 +69,19 @@ def test_windows_safe_import_and_memory_fallback():
 
 def test_resource_guard_stops_after_five_consecutive_critical_samples(monkeypatch):
     """O limite só deve parar o benchmark na quinta leitura crítica."""
-    memory_values = iter([95.0] * 5)
-
-    monkeypatch.setattr(
-        "app.core.resource_guard.psutil.virtual_memory",
-        lambda: SimpleNamespace(percent=next(memory_values), used=7 * 1024**3),
+    guard = SystemResourceGuard(
+        sample_interval_seconds=1,
+        stop_percent=95,
+        consecutive_samples=5,
+        load_grace_seconds=0,
     )
     monkeypatch.setattr(
-        "app.core.resource_guard.psutil.swap_memory",
-        lambda: SimpleNamespace(percent=0.0),
+        guard,
+        "_snapshot",
+        lambda: ResourceSnapshot(95.0, 7 * 1024, 0.0, 50.0, 95.0, 50.0, None, 7 * 1024, 50.0),
     )
-    monkeypatch.setattr(
-        "app.core.resource_guard.psutil.disk_usage",
-        lambda _path: SimpleNamespace(percent=50.0),
-    )
-    monkeypatch.setattr("app.core.resource_guard.psutil.disk_io_counters", lambda: None)
-
-    guard = SystemResourceGuard(sample_interval_seconds=1, stop_percent=95, consecutive_samples=5)
+    monkeypatch.setattr("app.core.resource_guard.time.monotonic", lambda: 100.0)
+    guard._monitoring_started_at = 0.0
     for _ in range(4):
         guard.sample_once()
         guard.checkpoint()
@@ -99,6 +93,7 @@ def test_resource_guard_stops_after_five_consecutive_critical_samples(monkeypatc
     metrics = guard.metrics()
     assert metrics["interrupted_by_resource_guard"] is True
     assert metrics["resource_samples"] == 5
+    guard.stop()
 
 
 def test_config_lookup():

@@ -11,7 +11,7 @@ Inspirado na arquitetura modular do projeto [`document_anonymizer`](file:///home
 | Modelo | Identificador Hugging Face | Dimensão | Max Seq Length | Particularidades Técnicas |
 | :--- | :--- | :--- | :--- | :--- |
 | **BGE-M3** | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) | 1024 | 8192 | Multilíngue, suporte a contextos extensos. |
-| **Qwen3-Embedding-8B** | [`Qwen/Qwen3-Embedding-8B`](https://huggingface.co/Qwen/Qwen3-Embedding-8B) | 4096 | 32768 | Modelo denso de 8B parâmetros, alta capacidade semântica, suporte a bfloat16. |
+| **Qwen3-Embedding-8B** | [`Qwen/Qwen3-Embedding-8B`](https://huggingface.co/Qwen/Qwen3-Embedding-8B) | 4096 | 8192 | Modelo denso de 8B parâmetros, alta capacidade semântica, suporte a bfloat16. Recomendado para GPU CUDA com VRAM suficiente; em CPU pode demandar muita RAM e paginação. |
 | **Multilingual-E5-Large** | [`intfloat/multilingual-e5-large`](https://huggingface.co/intfloat/multilingual-e5-large) | 1024 | 512 | Requer prefixo (`passage: `) para indexação de documentos. |
 | **Legal-BERTimbau-base** | [`rufimelo/Legal-BERTimbau-base`](https://huggingface.co/rufimelo/Legal-BERTimbau-base) | 768 | 512 | BERT treinado no domínio jurídico brasileiro com mean-pooling. |
 
@@ -33,6 +33,7 @@ Para cada modelo e para cada texto/chunk do documento:
    - **Chunks por segundo** (\(chunks/s\)).
 3. **Hardware & Memória**:
    - **RAM do Processo**: Consumo inicial, final e \(\Delta\) RAM (\(MB\)).
+   - **Pico de RAM do Processo Filho**: Memória máxima do processo isolado do modelo.
    - **VRAM da GPU (CUDA)**: Memória alocada, reservada e pico de VRAM (\(MB\)).
 4. **Integridade Numérica**:
    - Dimensão efetiva do vetor.
@@ -164,7 +165,10 @@ O painel oferece:
 - **Lista interativa com Caixas de Seleção (Checkboxes)** para cada modelo com botões de *Selecionar Todos* e *Desmarcar Todos*.
 - **Parâmetros ajustáveis** (Batch size, Chunk size, Estratégia de chunking).
 - **Visualização imediata**: Tabela detalhada de métricas, ranking com medalhas (mais rápido, maior throughput, menor VRAM) e gráficos comparativos gerados em tempo real.
-- **Download com 1 clique** dos relatórios estruturados em JSON.
+- **Download com 1 clique** do resultado estruturado em JSON após a conclusão da execução.
+- **Relatórios persistidos**: Com `save_report=True` (padrão), os arquivos da execução são salvos em `benchmark/data/results/<TIMESTAMP>_ID_<ID>/`.
+
+> **Observação:** O painel aguarda a conclusão de todos os modelos selecionados antes de exibir a tabela, o gráfico e o botão de download. O gráfico mostrado no navegador é interativo e temporário; os gráficos PNG são gerados pelo modo CLI.
 
 ### Documentação Swagger Interativa
 Acesse em:
@@ -182,6 +186,8 @@ Envia um documento e executa o benchmark em todos os modelos selecionados.
   - `chunk_size` *(opcional, padrão 500)*: Tamanho do chunk em caracteres.
   - `chunk_strategy` *(opcional, padrão "paragraph")*: `"paragraph"`, `"fixed"`, `"sentence"`.
   - `save_report` *(opcional, padrão True)*: Salva relatório em disco.
+
+Cada modelo é executado em um subprocesso isolado. Se houver pressão crítica de recursos, apenas o processo do modelo afetado é interrompido e o benchmark segue para os demais modelos.
 
 #### 2. `POST /api/v1/benchmark/vectorize`
 Vetoriza o documento com um único modelo e retorna métricas + vetores.
@@ -223,13 +229,50 @@ Os resultados são salvos em `benchmark/data/results/<TIMESTAMP>/`:
 - `memory_comparison.png`: Gráfico de consumo de RAM e pico de VRAM.
 - `metrics_dashboard.png`: Painel 2x2 com todas as métricas consolidadas.
 
+### Relatórios de Diagnóstico da Interface e API
+
+Quando `save_report=True` (padrão da interface e da API), os relatórios são salvos em `benchmark/data/results/<TIMESTAMP>_ID_<ID>/`:
+
+- `summary.json`: Resultado completo, organizado por modelo.
+- `summary.txt`: Resumo legível das métricas e erros.
+- `execution.log`: Linha do tempo da execução, com início e término dos modelos, PID, fases `load`, `warmup`, `encode`, interrupções e códigos de saída.
+- `resource_samples.jsonl`: Uma amostra por segundo de RAM do sistema, RAM do processo filho, disco, paginação e memória comprometida.
+
+Os arquivos de diagnóstico não registram o texto enviado nem os vetores produzidos. Eles são ignorados pelo Git junto aos demais resultados em `benchmark/data/results/`.
+
 ---
 
 ## Executando os Testes Automatizados
 
+### Proteção de recursos durante o benchmark
+
+O monitor coleta uma amostra por segundo. RAM em 95% ou mais gera um aviso,
+mas não encerra o modelo isoladamente. A regra RAM + disco só encerra o modelo
+após 30 segundos de tolerância de carregamento e cinco amostras consecutivas
+com RAM e atividade de disco em 95% ou mais, desde que o processo filho do
+modelo esteja usando pelo menos 40% da RAM física. Isso evita atribuir ao
+modelo uma atividade de disco causada por download, cache ou outros processos.
+O benchmark registra o erro e segue para o próximo modelo; não há retomada automática.
+Espaço ocupado no disco é registrado, mas não dispara essa regra de atividade.
+
+No Windows, memória comprometida em 95% ou mais do limite atual também encerra
+o modelo, já na primeira leitura crítica. Esse limite é fornecido pelo sistema e
+pode mudar com o crescimento do arquivo de paginação. Os limites ficam em
+`app/core/config.py`.
+
+Os relatórios incluem aviso de RAM alta, pico percentual de memória comprometida,
+uso máximo de RAM do processo filho, detecção de atividade de paginação e pico
+em páginas por segundo. Os eventos de fase, erros e códigos de saída ficam em
+`execution.log`; as leituras temporais detalhadas ficam em `resource_samples.jsonl`.
+O contador Windows `Memory\\Pages/sec` representa paginação do sistema inteiro,
+incluindo arquivos mapeados; não comprova uso do arquivo de paginação pelo modelo.
+Uma medição indisponível aparece como `null` no JSON, sem ser tratada como zero.
+Sem medição de atividade do disco, a regra combinada não dispara; sem medição
+de memória comprometida, essa proteção adicional também fica indisponível.
+
 O projeto conta com suite de testes completa via Pytest:
 
 ```bash
-poetry run pytest -v
+poetry run python -m pytest -v
 ```
 
